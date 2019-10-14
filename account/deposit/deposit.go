@@ -29,58 +29,76 @@ const (
 	MagnetLinkTimeoutField        = "timeout_at"
 	MagnetLinkMultiUseField       = "multi_use"
 	MagnetLinkExpectedAmountField = "expected_amount"
-	MagnetLinkFormat              = "iota://%s%s/?%s=%d&%s=%d&%s=%d"
+	MagnetLinkMessageField        = "message"
+	MagnetLinkFormat              = "iota://%s%s/?%s=%d&%s=%d&%s=%d&%s=%s"
 )
 
 // AsMagnetLink converts the conditions into a magnet link URL.
-func (dc *CDA) AsMagnetLink() (string, error) {
+func (cda *CDA) AsMagnetLink() (string, error) {
 	var expectedAmount uint64
-	if dc.ExpectedAmount != nil {
-		expectedAmount = *dc.ExpectedAmount
+	if cda.ExpectedAmount != nil {
+		expectedAmount = *cda.ExpectedAmount
 	}
-	checksum, err := dc.Checksum()
+	checksum, err := cda.Checksum()
 	if err != nil {
 		return "", err
 	}
 	var multiUse int
-	if dc.MultiUse {
+	if cda.MultiUse {
 		multiUse = 1
 	}
 
 	return fmt.Sprintf(MagnetLinkFormat,
-		dc.Address[:consts.HashTrytesSize],
+		cda.Address[:consts.HashTrytesSize],
 		checksum[consts.HashTrytesSize-consts.AddressChecksumTrytesSize:consts.HashTrytesSize],
-		MagnetLinkTimeoutField, dc.TimeoutAt.Unix(),
+		MagnetLinkTimeoutField, cda.TimeoutAt.Unix(),
 		MagnetLinkMultiUseField, multiUse,
-		MagnetLinkExpectedAmountField, expectedAmount), nil
+		MagnetLinkExpectedAmountField, expectedAmount,
+		MagnetLinkMessageField, func() string {
+			if cda.Message == nil {
+				return ""
+			}
+			return url.QueryEscape(*cda.Message)
+		}()), nil
 }
 
 // AsTransfer converts the conditional deposit address into a transfer object.
-func (dc *CDA) AsTransfer() bundle.Transfer {
+func (cda *CDA) AsTransfer() bundle.Transfer {
 	return bundle.Transfer{
-		Address: dc.Address,
+		Address: cda.Address,
 		Value: func() uint64 {
-			if dc.ExpectedAmount == nil {
+			if cda.ExpectedAmount == nil {
 				return 0
 			}
-			return *dc.ExpectedAmount
+			return *cda.ExpectedAmount
+		}(),
+		Message: func() Trytes {
+			if cda.Message == nil {
+				return ""
+			}
+			trytes, err := BytesToTrytes([]byte(*cda.Message))
+			if err != nil {
+				panic(err)
+			}
+			return trytes
 		}(),
 	}
 }
 
 // Checksum returns the checksum of the the CDA.
-func (dc *CDA) Checksum() (Trytes, error) {
+func (cda *CDA) Checksum() (Trytes, error) {
 	// checksum formula:
 	// Checksum = CurlHash(
 	// 	CurlHash(address_trits)[:134] +
 	// 	PadTrits27(timeout_value_trits) +
 	// 	MultiUse(0/1) +
-	// 	PadTrits81(amount_value_trits)
+	// 	PadTrits81(amount_value_trits) +
+	//  PadTo243Multiple(bytes_to_trits(message))
 	// )
-	if err := ValidateConditions(&dc.Conditions); err != nil {
+	if err := ValidateConditions(&cda.Conditions); err != nil {
 		return "", err
 	}
-	addrTrits, err := TrytesToTrits(dc.Address[:consts.HashTrytesSize])
+	addrTrits, err := TrytesToTrits(cda.Address[:consts.HashTrytesSize])
 	if err != nil {
 		return "", err
 	}
@@ -92,15 +110,15 @@ func (dc *CDA) Checksum() (Trytes, error) {
 	if err != nil {
 		return "", err
 	}
-	timeoutAtTrits := PadTrits(IntToTrits(dc.TimeoutAt.Unix()), 27)
+	timeoutAtTrits := PadTrits(IntToTrits(cda.TimeoutAt.Unix()), 27)
 	var expectedAmountTrits Trits
-	if dc.ExpectedAmount != nil {
-		expectedAmountTrits = PadTrits(IntToTrits(int64(*dc.ExpectedAmount)), 81)
+	if cda.ExpectedAmount != nil {
+		expectedAmountTrits = PadTrits(IntToTrits(int64(*cda.ExpectedAmount)), 81)
 	} else {
 		expectedAmountTrits = PadTrits(expectedAmountTrits, 81)
 	}
 	var multiUse int8
-	if dc.MultiUse {
+	if cda.MultiUse {
 		multiUse = 1
 	}
 	input := make(Trits, 0)
@@ -108,6 +126,18 @@ func (dc *CDA) Checksum() (Trytes, error) {
 	input = append(input, timeoutAtTrits...)
 	input = append(input, multiUse)
 	input = append(input, expectedAmountTrits...)
+
+	if cda.Message != nil && len(*cda.Message) != 0 {
+		msgTrits, err := BytesToTrits([]byte(*cda.Message))
+		if err != nil {
+			return "", err
+		}
+
+		// pad to multiple of 243
+		msgTritLen := len(msgTrits)
+		paddedMsgTrits := PadTrits(msgTrits, msgTritLen+(consts.HashTrinarySize-msgTritLen%consts.HashTrinarySize))
+		input = append(input, paddedMsgTrits...)
+	}
 	c.Reset()
 	if err := c.Absorb(input); err != nil {
 		return "", err
@@ -148,6 +178,14 @@ func ParseMagnetLink(cdaMagnetLink string) (*CDA, error) {
 	}
 	cda.ExpectedAmount = &expectedAmount
 
+	msg, err := url.QueryUnescape(query.Get(MagnetLinkMessageField))
+	if err != nil {
+		return nil, errors.Wrap(err, "invalid message")
+	}
+	if len(msg) != 0 {
+		cda.Message = &msg
+	}
+
 	computedChecksum, err := cda.Checksum()
 	if err != nil {
 		return nil, err
@@ -176,6 +214,8 @@ type Conditions struct {
 	// considered in the input selection.
 	// ExpectedAmount and MultiUse are mutually exclusive: MultiUse must be false if an ExpectedAmount over 0 is set.
 	ExpectedAmount *uint64 `json:"expected_amount,omitempty" bson:"expected_amount,omitempty"`
+	// An arbitrary message with an arbitrary size.
+	Message *string `json:"message,omitempty" bson:"message,omitempty"`
 }
 
 // ValidateConditions validates the deposit conditions.
